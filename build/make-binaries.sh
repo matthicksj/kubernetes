@@ -23,5 +23,6 @@ set -e
 
 source $(dirname $0)/common.sh
 
+verify-prereqs
 build-image
 run-build-command build/build-image/make-binaries.sh "$@"

@@ -14,44 +14,44 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// The controller manager is responsible for monitoring replication controllers, and creating corresponding
-// pods to achieve the desired state.  It listens for new controllers in etcd, and it sends requests to the
-// master to create/delete pods.
-//
-// TODO: Refactor the etcd watch code so that it is a pluggable interface.
+// The controller manager is responsible for monitoring replication
+// controllers, and creating corresponding pods to achieve the desired
+// state.  It uses the API to listen for new controllers and to create/delete
+// pods.
 package main
 
 import (
 	"flag"
-	"log"
-	"os"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/controller"
-	"github.com/coreos/go-etcd/etcd"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/version/verflag"
+	"github.com/golang/glog"
 )
 
 var (
-	etcd_servers = flag.String("etcd_servers", "", "Servers for the etcd (http://ip:port).")
-	master       = flag.String("master", "", "The address of the Kubernetes API server")
+	master = flag.String("master", "", "The address of the Kubernetes API server")
 )
 
 func main() {
 	flag.Parse()
+	util.InitLogs()
+	defer util.FlushLogs()
 
-	if len(*etcd_servers) == 0 || len(*master) == 0 {
-		log.Fatal("usage: controller-manager -etcd_servers <servers> -master <master>")
+	verflag.PrintAndExitIfRequested()
+
+	if len(*master) == 0 {
+		glog.Fatal("usage: controller-manager -master <master>")
 	}
 
-	// Set up logger for etcd client
-	etcd.SetLogger(log.New(os.Stderr, "etcd ", log.LstdFlags))
+	kubeClient, err := client.New(*master, nil)
+	if err != nil {
+		glog.Fatalf("Invalid -master: %v", err)
+	}
 
-	controllerManager := controller.MakeReplicationManager(etcd.NewClient([]string{*etcd_servers}),
-		client.Client{
-			Host: "http://" + *master,
-		})
-
+	controllerManager := controller.NewReplicationManager(kubeClient)
 	controllerManager.Run(10 * time.Second)
 	select {}
 }

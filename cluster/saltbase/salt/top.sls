@@ -8,11 +8,26 @@ base:
     - docker
     - kubelet
     - kube-proxy
+    - cadvisor
+    - nsinit
+{% if grains['cloud'] is defined and grains['cloud'] == 'azure' %}
+    - openvpn-client
+{% else %}
+    - sdn
+{% endif %}
 
   'roles:kubernetes-master':
     - match: grain
     - golang
+    - etcd
     - apiserver
     - controller-manager
-    - etcd
+    - scheduler
     - nginx
+{% if grains['cloud'] is defined and grains['cloud'] == 'azure' %}
+    - openvpn
+{% endif %}
+
+  'roles:kubernetes-pool-vsphere':
+    - match: grain
+    - static-routes

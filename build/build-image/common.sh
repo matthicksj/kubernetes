@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Copyright 2014 Google Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +19,7 @@
 
 cd $(dirname "${BASH_SOURCE}")/../.. >/dev/null
 readonly KUBE_REPO_ROOT="${PWD}"
-readonly KUBE_TARGET="${KUBE_REPO_ROOT}/output/build"
+readonly KUBE_TARGET="${KUBE_REPO_ROOT}/_output/build"
 readonly KUBE_GO_PACKAGE=github.com/GoogleCloudPlatform/kubernetes
 
 mkdir -p "${KUBE_TARGET}"
@@ -33,15 +35,14 @@ function make-binaries() {
     apiserver
     controller-manager
     kubelet
-    cloudcfg
-    localkube"
+    kubecfg"
 
   ARCH_TARGET="${KUBE_TARGET}/${GOOS}/${GOARCH}"
   mkdir -p "${ARCH_TARGET}"
 
   function make-binary() {
     echo "+++ Building $1 for ${GOOS}/${GOARCH}"
-    go build \
+    godep go build \
       -o "${ARCH_TARGET}/$1" \
       github.com/GoogleCloudPlatform/kubernetes/cmd/$1
   }

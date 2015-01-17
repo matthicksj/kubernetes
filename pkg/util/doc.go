@@ -15,5 +15,6 @@ limitations under the License.
 */
 
 // Package util implements various utility functions used in both testing and implementation
-// of Kubernetes
+// of Kubernetes. Package util may not depend on any other package in the Kubernetes
+// package tree.
 package util

@@ -17,31 +17,31 @@
 # Starts a Kubernetes cluster, runs the e2e test suite, and shuts it
 # down.
 
+source $(dirname $0)/../cluster/kube-env.sh
+source $(dirname $0)/../cluster/$KUBERNETES_PROVIDER/util.sh
+
 # For debugging of this test's components, it's helpful to leave the test
 # cluster running.
 ALREADY_UP=${1:-0}
 LEAVE_UP=${2:-0}
+TEAR_DOWN=${3:-0}
 
 # Exit on error
 set -e
 
-HAVE_JQ=$(which jq)
-if [[ -z ${HAVE_JQ} ]]; then
-  echo "Please install jq, e.g.: 'sudo apt-get install jq' or, "
-  echo "if you're on a mac with homebrew, 'brew install jq'."
-  exit 1
-fi
-
 # Use testing config
 export KUBE_CONFIG_FILE="config-test.sh"
 export KUBE_REPO_ROOT="$(dirname $0)/.."
-export CLOUDCFG="${KUBE_REPO_ROOT}/cluster/cloudcfg.sh"
+export CLOUDCFG="${KUBE_REPO_ROOT}/cluster/kubecfg.sh -expect_version_match"
 
-source "${KUBE_REPO_ROOT}/cluster/util.sh"
-${KUBE_REPO_ROOT}/hack/build-go.sh
+if [[ $TEAR_DOWN -ne 0 ]]; then
+  detect-project
+  trap test-teardown EXIT
+  exit 0
+fi
 
-# Build a release
-$(dirname $0)/../release/release.sh
+# Build a release required by the test provider [if any]
+test-build-release
 
 if [[ ${ALREADY_UP} -ne 1 ]]; then
   # Now bring a test cluster up with that release.
@@ -51,35 +51,13 @@ else
   $(dirname $0)/../cluster/kube-push.sh
 fi
 
-# Detect the project into $PROJECT if it isn't set
-detect-project
+# Perform any required setup of the cluster
+test-setup
 
 set +e
 
-if [[ ${ALREADY_UP} -ne 1 ]]; then
-  # Open up port 80 & 8080 so common containers on minions can be reached
-  gcutil addfirewall \
-    --norespect_terminal_width \
-    --project ${PROJECT} \
-    --target_tags ${MINION_TAG} \
-    --allowed tcp:80,tcp:8080 \
-    --network ${NETWORK} \
-    ${MINION_TAG}-http-alt
-fi
-
-# Auto shutdown cluster when we exit
-function shutdown-test-cluster () {
-  echo "Shutting down test cluster in background."
-  gcutil deletefirewall  \
-    --project ${PROJECT} \
-    --norespect_terminal_width \
-    --force \
-    ${MINION_TAG}-http-alt &
-  $(dirname $0)/../cluster/kube-down.sh > /dev/null &
-}
-
 if [[ ${LEAVE_UP} -ne 1 ]]; then
-  trap shutdown-test-cluster EXIT
+  trap test-teardown EXIT
 fi
 
 any_failed=0

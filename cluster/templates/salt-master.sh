@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Copyright 2014 Google Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +25,7 @@ cat <<EOF >/etc/salt/minion.d/grains.conf
 grains:
   roles:
     - kubernetes-master
+  cloud: gce
 EOF
 
 # Auto accept all keys from minions that try to join
@@ -47,6 +50,8 @@ echo $MASTER_HTPASSWD > /srv/salt/nginx/htpasswd
 # install.  See https://github.com/saltstack/salt-bootstrap/issues/270
 #
 # -M installs the master
-curl -L http://bootstrap.saltstack.com | sh -s -- -M -X
+set +x
+curl -L --connect-timeout 20 --retry 6 --retry-delay 10 http://bootstrap.saltstack.com | sh -s -- -M -X
+set -x
 
 echo $MASTER_HTPASSWD > /srv/salt/nginx/htpasswd

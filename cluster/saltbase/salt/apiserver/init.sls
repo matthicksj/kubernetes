@@ -1,12 +1,22 @@
 {% set root = '/var/src/apiserver' %}
 {% set package = 'github.com/GoogleCloudPlatform/kubernetes' %}
 {% set package_dir = root + '/src/' + package %}
+{% set go_opt = pillar['go_opt'] %}
+{% if grains['os_family'] == 'RedHat' %}
+{% set environment_file = '/etc/sysconfig/apiserver' %}
+{% else %}
+{% set environment_file = '/etc/default/apiserver' %}
+{% endif %}
 
 {{ package_dir }}:
   file.recurse:
     - source: salt://apiserver/go
     - user: root
+    {% if grains['os_family'] == 'RedHat' %}
+    - group: root
+    {% else %}
     - group: staff
+    {% endif %}
     - dir_mode: 775
     - file_mode: 664
     - makedirs: True
@@ -15,21 +25,7 @@
       - group
       - mode
 
-apiserver-third-party-go:
-  file.recurse:
-    - name: {{ root }}/src
-    - source: salt://third-party/go/src
-    - user: root
-    - group: staff
-    - dir_mode: 775
-    - file_mode: 664
-    - makedirs: True
-    - recurse:
-      - user
-      - group
-      - mode
-
-/etc/default/apiserver:
+{{ environment_file }}:
   file.managed:
     - source: salt://apiserver/default
     - template: jinja
@@ -38,14 +34,14 @@ apiserver-third-party-go:
     - mode: 644
 
 apiserver-build:
-  cmd.wait:
+  cmd.run:
     - cwd: {{ root }}
     - names:
-      - go build {{ package }}/cmd/apiserver
+      - go build {{ go_opt }} {{ package }}/cmd/apiserver
     - env:
       - PATH: {{ grains['path'] }}:/usr/local/bin
-      - GOPATH: {{ root }}
-    - watch:
+      - GOPATH: {{ root }}:{{ package_dir }}/Godeps/_workspace
+    - require:
       - file: {{ package_dir }}
 
 /usr/local/bin/apiserver:
@@ -54,12 +50,24 @@ apiserver-build:
     - watch:
       - cmd: apiserver-build
 
+{% if grains['os_family'] == 'RedHat' %}
+
+/usr/lib/systemd/system/apiserver.service:
+  file.managed:
+    - source: salt://apiserver/apiserver.service
+    - user: root
+    - group: root
+
+{% else %}
+
 /etc/init.d/apiserver:
   file.managed:
     - source: salt://apiserver/initd
     - user: root
     - group: root
     - mode: 755
+
+{% endif %}
 
 apiserver:
   group.present:
@@ -75,7 +83,8 @@ apiserver:
     - enable: True
     - watch:
       - cmd: apiserver-build
-      - file: /etc/default/apiserver
+      - file: {{ environment_file }}
       - file: /usr/local/bin/apiserver
+{% if grains['os_family'] != 'RedHat' %}
       - file: /etc/init.d/apiserver
-
+{% endif %}

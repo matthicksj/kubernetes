@@ -18,6 +18,8 @@ package labels
 
 import (
 	"testing"
+
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 )
 
 func TestSelectorParse(t *testing.T) {
@@ -84,6 +86,9 @@ func TestEverything(t *testing.T) {
 	if !Everything().Matches(Set{"x": "y"}) {
 		t.Errorf("Nil selector didn't match")
 	}
+	if !Everything().Empty() {
+		t.Errorf("Everything was not empty")
+	}
 }
 
 func TestSelectorMatches(t *testing.T) {
@@ -131,4 +136,119 @@ func TestSetMatches(t *testing.T) {
 	expectNoMatchDirect(t, Set{"foo": "=blah"}, labelset)
 	expectNoMatchDirect(t, Set{"baz": "=bar"}, labelset)
 	expectNoMatchDirect(t, Set{"foo": "=bar", "foobar": "bar", "baz": "blah"}, labelset)
+}
+
+func TestNilMapIsValid(t *testing.T) {
+	selector := Set(nil).AsSelector()
+	if selector == nil {
+		t.Errorf("Selector for nil set should be Everything")
+	}
+	if !selector.Empty() {
+		t.Errorf("Selector for nil set should be Empty")
+	}
+}
+
+func TestSetIsEmpty(t *testing.T) {
+	if !(Set{}).AsSelector().Empty() {
+		t.Errorf("Empty set should be empty")
+	}
+	if !(andTerm(nil)).Empty() {
+		t.Errorf("Nil andTerm should be empty")
+	}
+	if (&hasTerm{}).Empty() {
+		t.Errorf("hasTerm should not be empty")
+	}
+	if (&notHasTerm{}).Empty() {
+		t.Errorf("notHasTerm should not be empty")
+	}
+	if !(andTerm{andTerm{}}).Empty() {
+		t.Errorf("Nested andTerm should be empty")
+	}
+	if (andTerm{&hasTerm{"a", "b"}}).Empty() {
+		t.Errorf("Nested andTerm should not be empty")
+	}
+}
+
+func TestRequiresExactMatch(t *testing.T) {
+	testCases := map[string]struct {
+		S     Selector
+		Label string
+		Value string
+		Found bool
+	}{
+		"empty set":                 {Set{}.AsSelector(), "test", "", false},
+		"nil andTerm":               {andTerm(nil), "test", "", false},
+		"empty hasTerm":             {&hasTerm{}, "test", "", false},
+		"skipped hasTerm":           {&hasTerm{"a", "b"}, "test", "", false},
+		"valid hasTerm":             {&hasTerm{"test", "b"}, "test", "b", true},
+		"valid hasTerm no value":    {&hasTerm{"test", ""}, "test", "", true},
+		"valid notHasTerm":          {&notHasTerm{"test", "b"}, "test", "", false},
+		"valid notHasTerm no value": {&notHasTerm{"test", ""}, "test", "", false},
+		"nested andTerm":            {andTerm{andTerm{}}, "test", "", false},
+		"nested andTerm matches":    {andTerm{&hasTerm{"test", "b"}}, "test", "b", true},
+		"andTerm with non-match":    {andTerm{&hasTerm{}, &hasTerm{"test", "b"}}, "test", "b", true},
+	}
+	for k, v := range testCases {
+		value, found := v.S.RequiresExactMatch(v.Label)
+		if value != v.Value {
+			t.Errorf("%s: expected value %s, got %s", k, v.Value, value)
+		}
+		if found != v.Found {
+			t.Errorf("%s: expected found %s, got %s", k, v.Found, found)
+		}
+	}
+}
+
+func expectMatchRequirement(t *testing.T, req Requirement, ls Set) {
+	if !req.Matches(ls) {
+		t.Errorf("Wanted '%+v' to match '%s', but it did not.\n", req, ls)
+	}
+}
+
+func expectNoMatchRequirement(t *testing.T, req Requirement, ls Set) {
+	if req.Matches(ls) {
+		t.Errorf("Wanted '%+v' to not match '%s', but it did.", req, ls)
+	}
+}
+
+func TestRequirementMatches(t *testing.T) {
+	s := Set{"x": "foo", "y": "baz"}
+	a := Requirement{key: "x", operator: IN, strValues: util.NewStringSet("foo")}
+	b := Requirement{key: "x", operator: NOT_IN, strValues: util.NewStringSet("beta")}
+	c := Requirement{key: "y", operator: IN, strValues: nil}
+	d := Requirement{key: "y", strValues: util.NewStringSet("foo")}
+	expectMatchRequirement(t, a, s)
+	expectMatchRequirement(t, b, s)
+	expectNoMatchRequirement(t, c, s)
+	expectNoMatchRequirement(t, d, s)
+}
+
+func expectMatchLabSelector(t *testing.T, lsel LabelSelector, s Set) {
+	if !lsel.Matches(s) {
+		t.Errorf("Wanted '%+v' to match '%s', but it did not.\n", lsel, s)
+	}
+}
+
+func expectNoMatchLabSelector(t *testing.T, lsel LabelSelector, s Set) {
+	if lsel.Matches(s) {
+		t.Errorf("Wanted '%+v' to not match '%s', but it did.\n", lsel, s)
+	}
+}
+
+func TestLabelSelectorMatches(t *testing.T) {
+	s := Set{"x": "foo", "y": "baz"}
+	allMatch := LabelSelector{
+		Requirements: []Requirement{
+			{key: "x", operator: IN, strValues: util.NewStringSet("foo")},
+			{key: "y", operator: NOT_IN, strValues: util.NewStringSet("alpha")},
+		},
+	}
+	singleNonMatch := LabelSelector{
+		Requirements: []Requirement{
+			{key: "x", operator: IN, strValues: util.NewStringSet("foo")},
+			{key: "y", operator: IN, strValues: util.NewStringSet("alpha")},
+		},
+	}
+	expectMatchLabSelector(t, allMatch, s)
+	expectNoMatchLabSelector(t, singleNonMatch, s)
 }

@@ -26,8 +26,11 @@ RUN apt-get update -y && apt-get install --no-install-recommends -y -q \
   rsync
 
 # Install Go
-# TODO(jbeda) -- we need to verify this against the hash
-RUN curl -s https://storage.googleapis.com/golang/go1.2.2.src.tar.gz | tar -C /usr/local -xz
+# Save the SHA1 checksum from http://golang.org/dl
+RUN echo '9f9dfcbcb4fa126b2b66c0830dc733215f2f056e  go1.3.src.tar.gz' > go1.3.src.tar.gz.sha1
+RUN curl -O -s https://storage.googleapis.com/golang/go1.3.src.tar.gz
+RUN sha1sum --check go1.3.src.tar.gz.sha1
+RUN tar -xzf go1.3.src.tar.gz -C /usr/local
 ENV PATH  /usr/local/go/bin:$PATH
 RUN cd /usr/local/go/src && ./make.bash --no-clean 2>&1
 
@@ -42,17 +45,17 @@ RUN cd /usr/local/go/src && \
 
 # Set up Go Environment
 ENV PATH    /go/bin:$PATH
-ENV GOPATH  /go:/go/src/github.com/GoogleCloudPlatform/kubernetes/third_party
+ENV GOPATH  /go
 ENV GOOS    linux
 ENV GOARCH  amd64
 
 # Get the code coverage tool and etcd for integration tests
-RUN go get code.google.com/p/go.tools/cmd/cover github.com/coreos/etcd
+RUN go get code.google.com/p/go.tools/cmd/cover github.com/coreos/etcd github.com/tools/godep
 
 # Mark this as a kube-build container
 RUN touch /kube-build-image
 
 WORKDIR /go/src/github.com/GoogleCloudPlatform/kubernetes
 
-# Upload Kubernetes
+# Upload Kubernetes source
 ADD kube-source.tar.gz /go/src/github.com/GoogleCloudPlatform/kubernetes

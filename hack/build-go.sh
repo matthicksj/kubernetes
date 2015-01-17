@@ -16,15 +16,51 @@
 
 # This script sets up a go workspace locally and builds all go components.
 
-set -e
+set -o errexit
+set -o nounset
+set -o pipefail
 
-source $(dirname $0)/config-go.sh
+hackdir=$(CDPATH="" cd $(dirname $0); pwd)
 
-cd "${KUBE_TARGET}"
+# Set the environment variables required by the build.
+. "${hackdir}/config-go.sh"
 
-BINARIES="proxy integration apiserver controller-manager kubelet cloudcfg localkube"
+# Go to the top of the tree.
+cd "${KUBE_REPO_ROOT}"
 
-for b in $BINARIES; do
-  echo "+++ Building ${b}"
-  go build "${KUBE_GO_PACKAGE}"/cmd/${b}
+# Check for `go` binary and set ${GOPATH}.
+kube::setup_go_environment
+
+# Fetch the version.
+version_ldflags=$(kube::version_ldflags)
+
+if [[ $# == 0 ]]; then
+  # Update $@ with the default list of targets to build.
+  set -- \
+      cmd/proxy \
+      cmd/apiserver \
+      cmd/controller-manager \
+      cmd/kubelet cmd/kubecfg \
+      plugin/cmd/scheduler
+fi
+
+# Use eval to preserve embedded quoted strings.
+eval "goflags=(${GOFLAGS:-})"
+
+binaries=()
+for arg; do
+  if [[ "${arg}" == -* ]]; then
+    # Assume arguments starting with a dash are flags to pass to go.
+    goflags+=("${arg}")
+  else
+    binaries+=("${KUBE_GO_PACKAGE}/${arg}")
+  fi
 done
+
+# Note that the flags to 'go build' are duplicated in the salt build setup
+# (release/build-release.sh) for our cluster deploy.  If we add more command
+# line options to our standard build we'll want to duplicate them there.  As we
+# move to distributing pre- built binaries we can eliminate this duplication.
+go install "${goflags[@]:+${goflags[@]}}" \
+    -ldflags "${version_ldflags}" \
+    "${binaries[@]}"

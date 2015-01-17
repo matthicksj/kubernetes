@@ -18,14 +18,16 @@ set -e
 
 source $(dirname $0)/common.sh
 
-ETCD_DIR="${KUBE_REPO_ROOT}/output/etcd"
+ETCD_DIR="${KUBE_REPO_ROOT}/_output/etcd"
 mkdir -p "${ETCD_DIR}"
 
-etcd -name test -data-dir ${ETCD_DIR} > "${KUBE_REPO_ROOT}/output/etcd.log" &
+echo "+++ Running integration test"
+
+etcd -name test -data-dir ${ETCD_DIR} > "${KUBE_REPO_ROOT}/_output/etcd.log" &
 ETCD_PID=$!
 
 sleep 5
 
-${KUBE_TARGET}/integration
+${KUBE_TARGET}/linux/amd64/integration
 
 kill $ETCD_PID

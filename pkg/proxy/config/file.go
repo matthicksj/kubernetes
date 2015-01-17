@@ -28,35 +28,38 @@ limitations under the License.
 //   }
 //]
 //}
+
 package config
 
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
-	"log"
 	"reflect"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"github.com/golang/glog"
 )
 
-// TODO: kill this struct.
-type ServiceJSON struct {
-	Name      string
-	Port      int
-	Endpoints []string
-}
-type ConfigFile struct {
-	Services []ServiceJSON
+// serviceConfig is a deserialized form of the config file format which ConfigSourceFile accepts.
+type serviceConfig struct {
+	Services []struct {
+		Name      string   `json: "name"`
+		Port      int      `json: "port"`
+		Endpoints []string `json: "endpoints"`
+	} `json: "service"`
 }
 
+// ConfigSourceFile periodically reads service configurations in JSON from a file, and sends the services and endpoints defined in the file to the specified channels.
 type ConfigSourceFile struct {
 	serviceChannel   chan ServiceUpdate
 	endpointsChannel chan EndpointsUpdate
 	filename         string
 }
 
+// NewConfigSourceFile creates a new ConfigSourceFile and let it immediately runs the created ConfigSourceFile in a goroutine.
 func NewConfigSourceFile(filename string, serviceChannel chan ServiceUpdate, endpointsChannel chan EndpointsUpdate) ConfigSourceFile {
 	config := ConfigSourceFile{
 		filename:         filename,
@@ -67,45 +70,61 @@ func NewConfigSourceFile(filename string, serviceChannel chan ServiceUpdate, end
 	return config
 }
 
-func (impl ConfigSourceFile) Run() {
-	log.Printf("Watching file %s", impl.filename)
+// Run begins watching the config file.
+func (s ConfigSourceFile) Run() {
+	glog.Infof("Watching file %s", s.filename)
 	var lastData []byte
 	var lastServices []api.Service
 	var lastEndpoints []api.Endpoints
 
+	sleep := 5 * time.Second
+	// Used to avoid spamming the error log file, makes error logging edge triggered.
+	hadSuccess := true
 	for {
-		data, err := ioutil.ReadFile(impl.filename)
+		data, err := ioutil.ReadFile(s.filename)
 		if err != nil {
-			log.Printf("Couldn't read file: %s : %v", impl.filename, err)
-		} else {
-			var config ConfigFile
-			err = json.Unmarshal(data, &config)
-			if err != nil {
-				log.Printf("Couldn't unmarshal configuration from file : %s %v", data, err)
+			msg := fmt.Sprintf("Couldn't read file: %s : %v", s.filename, err)
+			if hadSuccess {
+				glog.Error(msg)
 			} else {
-				if !bytes.Equal(lastData, data) {
-					lastData = data
-					// Ok, we have a valid configuration, send to channel for
-					// rejiggering.
-					newServices := make([]api.Service, len(config.Services))
-					newEndpoints := make([]api.Endpoints, len(config.Services))
-					for i, service := range config.Services {
-						newServices[i] = api.Service{JSONBase: api.JSONBase{ID: service.Name}, Port: service.Port}
-						newEndpoints[i] = api.Endpoints{Name: service.Name, Endpoints: service.Endpoints}
-					}
-					if !reflect.DeepEqual(lastServices, newServices) {
-						serviceUpdate := ServiceUpdate{Op: SET, Services: newServices}
-						impl.serviceChannel <- serviceUpdate
-						lastServices = newServices
-					}
-					if !reflect.DeepEqual(lastEndpoints, newEndpoints) {
-						endpointsUpdate := EndpointsUpdate{Op: SET, Endpoints: newEndpoints}
-						impl.endpointsChannel <- endpointsUpdate
-						lastEndpoints = newEndpoints
-					}
-				}
+				glog.V(1).Info(msg)
 			}
+			hadSuccess = false
+			time.Sleep(sleep)
+			continue
 		}
-		time.Sleep(5 * time.Second)
+		hadSuccess = true
+
+		if bytes.Equal(lastData, data) {
+			time.Sleep(sleep)
+			continue
+		}
+		lastData = data
+
+		config := &serviceConfig{}
+		if err = json.Unmarshal(data, config); err != nil {
+			glog.Errorf("Couldn't unmarshal configuration from file : %s %v", data, err)
+			continue
+		}
+		// Ok, we have a valid configuration, send to channel for
+		// rejiggering.
+		newServices := make([]api.Service, len(config.Services))
+		newEndpoints := make([]api.Endpoints, len(config.Services))
+		for i, service := range config.Services {
+			newServices[i] = api.Service{JSONBase: api.JSONBase{ID: service.Name}, Port: service.Port}
+			newEndpoints[i] = api.Endpoints{JSONBase: api.JSONBase{ID: service.Name}, Endpoints: service.Endpoints}
+		}
+		if !reflect.DeepEqual(lastServices, newServices) {
+			serviceUpdate := ServiceUpdate{Op: SET, Services: newServices}
+			s.serviceChannel <- serviceUpdate
+			lastServices = newServices
+		}
+		if !reflect.DeepEqual(lastEndpoints, newEndpoints) {
+			endpointsUpdate := EndpointsUpdate{Op: SET, Endpoints: newEndpoints}
+			s.endpointsChannel <- endpointsUpdate
+			lastEndpoints = newEndpoints
+		}
+
+		time.Sleep(sleep)
 	}
 }

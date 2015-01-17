@@ -20,14 +20,25 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 )
 
-// Represents a selector.
+// Selector represents a label selector.
 type Selector interface {
-	// Returns true if this selector matches the given set of labels.
+	// Matches returns true if this selector matches the given set of labels.
 	Matches(Labels) bool
 
-	// Prints a human readable version of this selector.
+	// Empty returns true if this selector does not restrict the selection space.
+	Empty() bool
+
+	// RequiresExactMatch allows a caller to introspect whether a given selector
+	// requires a single specific label to be set, and if so returns the value it
+	// requires.
+	// TODO: expand this to be more general
+	RequiresExactMatch(label string) (value string, found bool)
+
+	// String returns a human readable string that represents this selector.
 	String() string
 }
 
@@ -44,6 +55,17 @@ func (t *hasTerm) Matches(ls Labels) bool {
 	return ls.Get(t.label) == t.value
 }
 
+func (t *hasTerm) Empty() bool {
+	return false
+}
+
+func (t *hasTerm) RequiresExactMatch(label string) (value string, found bool) {
+	if t.label == label {
+		return t.value, true
+	}
+	return "", false
+}
+
 func (t *hasTerm) String() string {
 	return fmt.Sprintf("%v=%v", t.label, t.value)
 }
@@ -54,6 +76,14 @@ type notHasTerm struct {
 
 func (t *notHasTerm) Matches(ls Labels) bool {
 	return ls.Get(t.label) != t.value
+}
+
+func (t *notHasTerm) Empty() bool {
+	return false
+}
+
+func (t *notHasTerm) RequiresExactMatch(label string) (value string, found bool) {
+	return "", false
 }
 
 func (t *notHasTerm) String() string {
@@ -71,12 +101,81 @@ func (t andTerm) Matches(ls Labels) bool {
 	return true
 }
 
+func (t andTerm) Empty() bool {
+	if t == nil {
+		return true
+	}
+	if len([]Selector(t)) == 0 {
+		return true
+	}
+	for i := range t {
+		if !t[i].Empty() {
+			return false
+		}
+	}
+	return true
+}
+
+func (t andTerm) RequiresExactMatch(label string) (string, bool) {
+	if t == nil || len([]Selector(t)) == 0 {
+		return "", false
+	}
+	for i := range t {
+		if value, found := t[i].RequiresExactMatch(label); found {
+			return value, found
+		}
+	}
+	return "", false
+}
+
 func (t andTerm) String() string {
 	var terms []string
 	for _, q := range t {
 		terms = append(terms, q.String())
 	}
 	return strings.Join(terms, ",")
+}
+
+// Operator represents a key's relationship
+// to a set of values in a Requirement.
+// TODO: Should also represent key's existence.
+type Operator int
+
+const (
+	IN Operator = iota + 1
+	NOT_IN
+)
+
+// LabelSelector only not named 'Selector' due
+// to name conflict until Selector is deprecated.
+type LabelSelector struct {
+	Requirements []Requirement
+}
+
+type Requirement struct {
+	key       string
+	operator  Operator
+	strValues util.StringSet
+}
+
+func (r *Requirement) Matches(ls Labels) bool {
+	switch r.operator {
+	case IN:
+		return r.strValues.Has(ls.Get(r.key))
+	case NOT_IN:
+		return !r.strValues.Has(ls.Get(r.key))
+	default:
+		return false
+	}
+}
+
+func (sg *LabelSelector) Matches(ls Labels) bool {
+	for _, req := range sg.Requirements {
+		if !req.Matches(ls) {
+			return false
+		}
+	}
+	return true
 }
 
 func try(selectorPiece, op string) (lhs, rhs string, ok bool) {
@@ -87,9 +186,13 @@ func try(selectorPiece, op string) (lhs, rhs string, ok bool) {
 	return "", "", false
 }
 
-// Given a Set, return a Selector which will match exactly that Set.
+// SelectorFromSet returns a Selector which will match exactly the given Set. A
+// nil Set is considered equivalent to Everything().
 func SelectorFromSet(ls Set) Selector {
-	var items []Selector
+	if ls == nil {
+		return Everything()
+	}
+	items := make([]Selector, 0, len(ls))
 	for label, value := range ls {
 		items = append(items, &hasTerm{label: label, value: value})
 	}
@@ -99,7 +202,8 @@ func SelectorFromSet(ls Set) Selector {
 	return andTerm(items)
 }
 
-// Takes a string repsenting a selector and returns an object suitable for matching, or an error.
+// ParseSelector takes a string representing a selector and returns an
+// object suitable for matching, or an error.
 func ParseSelector(selector string) (Selector, error) {
 	parts := strings.Split(selector, ",")
 	sort.StringSlice(parts).Sort()

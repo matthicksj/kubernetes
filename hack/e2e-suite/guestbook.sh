@@ -20,7 +20,9 @@
 
 set -e
 
-source "${KUBE_REPO_ROOT}/cluster/util.sh"
+source "${KUBE_REPO_ROOT}/cluster/kube-env.sh"
+source "${KUBE_REPO_ROOT}/cluster/$KUBERNETES_PROVIDER/util.sh"
+
 GUESTBOOK="${KUBE_REPO_ROOT}/examples/guestbook"
 
 # Launch the guestbook example
@@ -30,7 +32,7 @@ $CLOUDCFG -c "${GUESTBOOK}/redis-slave-controller.json" create /replicationContr
 
 sleep 5
 
-POD_LIST_1=$($CLOUDCFG -json list pods | jq ".items[].id")
+POD_LIST_1=$($CLOUDCFG '-template={{range.Items}}{{.ID}} {{end}}' list pods)
 echo "Pods running: ${POD_LIST_1}"
 
 $CLOUDCFG stop redisSlaveController
@@ -40,7 +42,7 @@ $CLOUDCFG rm redisSlaveController
 $CLOUDCFG delete services/redismaster
 $CLOUDCFG delete pods/redis-master-2
 
-POD_LIST_2=$($CLOUDCFG -json list pods | jq ".items[].id")
+POD_LIST_2=$($CLOUDCFG '-template={{range.Items}}{{.ID}} {{end}}' list pods)
 echo "Pods running after shutdown: ${POD_LIST_2}"
 
 exit 0

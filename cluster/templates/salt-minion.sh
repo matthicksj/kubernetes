@@ -1,3 +1,5 @@
+#!/bin/bash
+
 # Copyright 2014 Google Inc. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,10 +31,11 @@ grains:
   roles:
     - kubernetes-pool
   cbr-cidr: $MINION_IP_RANGE
+  cloud: gce
 EOF
 
 # Install Salt
 #
 # We specify -X to avoid a race condition that can cause minion failure to
 # install.  See https://github.com/saltstack/salt-bootstrap/issues/270
-curl -L http://bootstrap.saltstack.com | sh -s -- -X
+curl -L --connect-timeout 20 --retry 6 --retry-delay 10 https://bootstrap.saltstack.com | sh -s -- -X

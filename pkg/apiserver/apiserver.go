@@ -20,281 +20,183 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
-	"net/url"
 	"runtime/debug"
 	"strings"
 	"time"
 
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/labels"
-	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/healthz"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/httplog"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/version"
+	"github.com/golang/glog"
 )
 
-// RESTStorage is a generic interface for RESTful storage services
-type RESTStorage interface {
-	List(labels.Selector) (interface{}, error)
-	Get(id string) (interface{}, error)
-	Delete(id string) (<-chan interface{}, error)
-	Extract(body string) (interface{}, error)
-	Create(interface{}) (<-chan interface{}, error)
-	Update(interface{}) (<-chan interface{}, error)
+// Codec defines methods for serializing and deserializing API objects.
+type Codec interface {
+	Encode(obj interface{}) (data []byte, err error)
+	Decode(data []byte) (interface{}, error)
+	DecodeInto(data []byte, obj interface{}) error
 }
 
-func MakeAsync(fn func() interface{}) <-chan interface{} {
-	channel := make(chan interface{}, 1)
-	go func() {
-		defer util.HandleCrash()
-		channel <- fn()
-	}()
-	return channel
+// mux is an object that can register http handlers.
+type mux interface {
+	Handle(pattern string, handler http.Handler)
+	HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request))
 }
 
-// Status is a return value for calls that don't return other objects
-type Status struct {
-	Success bool
+// defaultAPIServer exposes nested objects for testability.
+type defaultAPIServer struct {
+	http.Handler
+	group *APIGroup
 }
 
-// ApiServer is an HTTPHandler that delegates to RESTStorage objects.
+// Handle returns a Handler function that expose the provided storage interfaces
+// as RESTful resources at prefix, serialized by codec, and also includes the support
+// http resources.
+func Handle(storage map[string]RESTStorage, codec Codec, prefix string) http.Handler {
+	group := NewAPIGroup(storage, codec)
+
+	mux := http.NewServeMux()
+	group.InstallREST(mux, prefix)
+	InstallSupport(mux)
+
+	return &defaultAPIServer{RecoverPanics(mux), group}
+}
+
+// APIGroup is a http.Handler that exposes multiple RESTStorage objects
 // It handles URLs of the form:
-// ${prefix}/${storage_key}[/${object_name}]
-// Where 'prefix' is an arbitrary string, and 'storage_key' points to a RESTStorage object stored in storage.
+// /${storage_key}[/${object_name}]
+// Where 'storage_key' points to a RESTStorage object stored in storage.
 //
 // TODO: consider migrating this to go-restful which is a more full-featured version of the same thing.
-type ApiServer struct {
-	prefix  string
-	storage map[string]RESTStorage
+type APIGroup struct {
+	handler RESTHandler
 }
 
-// New creates a new ApiServer object.
-// 'storage' contains a map of handlers.
-// 'prefix' is the hosting path prefix.
-func New(storage map[string]RESTStorage, prefix string) *ApiServer {
-	return &ApiServer{
+// NewAPIGroup returns an object that will serve a set of REST resources and their
+// associated operations.  The provided codec controls serialization and deserialization.
+// This is a helper method for registering multiple sets of REST handlers under different
+// prefixes onto a server.
+// TODO: add multitype codec serialization
+func NewAPIGroup(storage map[string]RESTStorage, codec Codec) *APIGroup {
+	return &APIGroup{RESTHandler{
 		storage: storage,
-		prefix:  prefix,
+		codec:   codec,
+		ops:     NewOperations(),
+		// Delay just long enough to handle most simple write operations
+		asyncOpWait: time.Millisecond * 25,
+	}}
+}
+
+// InstallREST registers the REST handlers (storage, watch, and operations) into a mux.
+// It is expected that the provided prefix will serve all operations. Path MUST NOT end
+// in a slash.
+func (g *APIGroup) InstallREST(mux mux, paths ...string) {
+	restHandler := &g.handler
+	watchHandler := &WatchHandler{g.handler.storage, g.handler.codec}
+	redirectHandler := &RedirectHandler{g.handler.storage, g.handler.codec}
+	opHandler := &OperationHandler{g.handler.ops, g.handler.codec}
+
+	for _, prefix := range paths {
+		prefix = strings.TrimRight(prefix, "/")
+		mux.Handle(prefix+"/", http.StripPrefix(prefix, restHandler))
+		mux.Handle(prefix+"/watch/", http.StripPrefix(prefix+"/watch/", watchHandler))
+		mux.Handle(prefix+"/redirect/", http.StripPrefix(prefix+"/redirect/", redirectHandler))
+		mux.Handle(prefix+"/operations", http.StripPrefix(prefix+"/operations", opHandler))
+		mux.Handle(prefix+"/operations/", http.StripPrefix(prefix+"/operations/", opHandler))
 	}
 }
 
-func (server *ApiServer) handleIndex(w http.ResponseWriter) {
-	w.WriteHeader(http.StatusOK)
-	// TODO: serve this out of a file?
-	data := "<html><body>Welcome to Kubernetes</body></html>"
-	fmt.Fprint(w, data)
+// InstallSupport registers the APIServer support functions into a mux.
+func InstallSupport(mux mux) {
+	healthz.InstallHandler(mux)
+	mux.Handle("/logs/", http.StripPrefix("/logs/", http.FileServer(http.Dir("/var/log/"))))
+	mux.Handle("/proxy/minion/", http.StripPrefix("/proxy/minion", http.HandlerFunc(handleProxyMinion)))
+	mux.HandleFunc("/version", handleVersion)
+	mux.HandleFunc("/", handleIndex)
 }
 
-// HTTP Handler interface
-func (server *ApiServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	defer func() {
-		if x := recover(); x != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprint(w, "apiserver panic. Look in log for details.")
-			log.Printf("ApiServer panic'd on %v %v: %#v\n%s\n", req.Method, req.RequestURI, x, debug.Stack())
-		}
-	}()
-	logger := MakeLogged(req, w)
-	w = logger
-	defer logger.Log()
-	url, err := url.ParseRequestURI(req.RequestURI)
+// RecoverPanics wraps an http Handler to recover and log panics.
+func RecoverPanics(handler http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		defer func() {
+			if x := recover(); x != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				fmt.Fprint(w, "apis panic. Look in log for details.")
+				glog.Infof("APIServer panic'd on %v %v: %#v\n%s\n", req.Method, req.RequestURI, x, debug.Stack())
+			}
+		}()
+		defer httplog.NewLogged(req, &w).StacktraceWhen(
+			httplog.StatusIsNot(
+				http.StatusOK,
+				http.StatusAccepted,
+				http.StatusTemporaryRedirect,
+				http.StatusConflict,
+				http.StatusNotFound,
+			),
+		).Log()
+
+		// Dispatch to the internal handler
+		handler.ServeHTTP(w, req)
+	})
+}
+
+// handleVersion writes the server's version information.
+func handleVersion(w http.ResponseWriter, req *http.Request) {
+	writeRawJSON(http.StatusOK, version.Get(), w)
+}
+
+// writeJSON renders an object as JSON to the response.
+func writeJSON(statusCode int, codec Codec, object interface{}, w http.ResponseWriter) {
+	output, err := codec.Encode(object)
 	if err != nil {
-		server.error(err, w)
+		errorJSON(err, codec, w)
 		return
 	}
-	if url.Path == "/index.html" || url.Path == "/" || url.Path == "" {
-		server.handleIndex(w)
-		return
-	}
-	if !strings.HasPrefix(url.Path, server.prefix) {
-		server.notFound(req, w)
-		return
-	}
-	requestParts := strings.Split(url.Path[len(server.prefix):], "/")[1:]
-	if len(requestParts) < 1 {
-		server.notFound(req, w)
-		return
-	}
-	storage := server.storage[requestParts[0]]
-	if storage == nil {
-		logger.Addf("'%v' has no storage object", requestParts[0])
-		server.notFound(req, w)
-		return
-	} else {
-		server.handleREST(requestParts, url, req, w, storage)
-	}
-}
-
-func (server *ApiServer) notFound(req *http.Request, w http.ResponseWriter) {
-	w.WriteHeader(http.StatusNotFound)
-	fmt.Fprintf(w, "Not Found: %#v", req)
-}
-
-func (server *ApiServer) write(statusCode int, object interface{}, w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(statusCode)
-	output, err := json.MarshalIndent(object, "", "    ")
-	if err != nil {
-		server.error(err, w)
-		return
-	}
 	w.Write(output)
 }
 
-func (server *ApiServer) error(err error, w http.ResponseWriter) {
-	w.WriteHeader(500)
-	fmt.Fprintf(w, "Internal Error: %#v", err)
+// errorJSON renders an error to the response.
+func errorJSON(err error, codec Codec, w http.ResponseWriter) {
+	status := errToAPIStatus(err)
+	writeJSON(status.Code, codec, status, w)
 }
 
-func (server *ApiServer) readBody(req *http.Request) (string, error) {
+// writeRawJSON writes a non-API object in JSON.
+func writeRawJSON(statusCode int, object interface{}, w http.ResponseWriter) {
+	output, err := json.Marshal(object)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	w.Write(output)
+}
+
+func parseTimeout(str string) time.Duration {
+	if str != "" {
+		timeout, err := time.ParseDuration(str)
+		if err == nil {
+			return timeout
+		}
+		glog.Errorf("Failed to parse: %#v '%s'", err, str)
+	}
+	return 30 * time.Second
+}
+
+func readBody(req *http.Request) ([]byte, error) {
 	defer req.Body.Close()
-	body, err := ioutil.ReadAll(req.Body)
-	return string(body), err
+	return ioutil.ReadAll(req.Body)
 }
 
-func (server *ApiServer) waitForObject(out <-chan interface{}, timeout time.Duration) (interface{}, error) {
-	tick := time.After(timeout)
-	var obj interface{}
-	select {
-	case obj = <-out:
-		return obj, nil
-	case <-tick:
-		return nil, fmt.Errorf("Timed out waiting for synchronization.")
+// splitPath returns the segments for a URL path.
+func splitPath(path string) []string {
+	path = strings.Trim(path, "/")
+	if path == "" {
+		return []string{}
 	}
-}
-
-// handleREST is the main dispatcher for the server.  It switches on the HTTP method, and then
-// on path length, according to the following table:
-//   Method     Path          Action
-//   GET        /foo          list
-//   GET        /foo/bar      get 'bar'
-//   POST       /foo          create
-//   PUT        /foo/bar      update 'bar'
-//   DELETE     /foo/bar      delete 'bar'
-// Returns 404 if the method/pattern doesn't match one of these entries
-// The server accepts several query parameters:
-//    sync=[false|true] Synchronous request (only applies to create, update, delete operations)
-//    timeout=<duration> Timeout for synchronous requests, only applies if sync=true
-//    labels=<label-selector> Used for filtering list operations
-func (server *ApiServer) handleREST(parts []string, requestUrl *url.URL, req *http.Request, w http.ResponseWriter, storage RESTStorage) {
-	sync := requestUrl.Query().Get("sync") == "true"
-	timeout, err := time.ParseDuration(requestUrl.Query().Get("timeout"))
-	if err != nil && len(requestUrl.Query().Get("timeout")) > 0 {
-		log.Printf("Failed to parse: %#v '%s'", err, requestUrl.Query().Get("timeout"))
-		timeout = time.Second * 30
-	}
-	switch req.Method {
-	case "GET":
-		switch len(parts) {
-		case 1:
-			selector, err := labels.ParseSelector(requestUrl.Query().Get("labels"))
-			if err != nil {
-				server.error(err, w)
-				return
-			}
-			controllers, err := storage.List(selector)
-			if err != nil {
-				server.error(err, w)
-				return
-			}
-			server.write(http.StatusOK, controllers, w)
-		case 2:
-			item, err := storage.Get(parts[1])
-			if err != nil {
-				server.error(err, w)
-				return
-			}
-			if item == nil {
-				server.notFound(req, w)
-				return
-			}
-			server.write(http.StatusOK, item, w)
-		default:
-			server.notFound(req, w)
-		}
-		return
-	case "POST":
-		if len(parts) != 1 {
-			server.notFound(req, w)
-			return
-		}
-		body, err := server.readBody(req)
-		if err != nil {
-			server.error(err, w)
-			return
-		}
-		obj, err := storage.Extract(body)
-		if err != nil {
-			server.error(err, w)
-			return
-		}
-		out, err := storage.Create(obj)
-		if err == nil && sync {
-			obj, err = server.waitForObject(out, timeout)
-		}
-		if err != nil {
-			server.error(err, w)
-			return
-		}
-		var statusCode int
-		if sync {
-			statusCode = http.StatusOK
-		} else {
-			statusCode = http.StatusAccepted
-		}
-		server.write(statusCode, obj, w)
-		return
-	case "DELETE":
-		if len(parts) != 2 {
-			server.notFound(req, w)
-			return
-		}
-		out, err := storage.Delete(parts[1])
-		var obj interface{}
-		obj = Status{Success: true}
-		if err == nil && sync {
-			obj, err = server.waitForObject(out, timeout)
-		}
-		if err != nil {
-			server.error(err, w)
-			return
-		}
-		var statusCode int
-		if sync {
-			statusCode = http.StatusOK
-		} else {
-			statusCode = http.StatusAccepted
-		}
-		server.write(statusCode, obj, w)
-		return
-	case "PUT":
-		if len(parts) != 2 {
-			server.notFound(req, w)
-			return
-		}
-		body, err := server.readBody(req)
-		if err != nil {
-			server.error(err, w)
-		}
-		obj, err := storage.Extract(body)
-		if err != nil {
-			server.error(err, w)
-			return
-		}
-		out, err := storage.Update(obj)
-		if err == nil && sync {
-			obj, err = server.waitForObject(out, timeout)
-		}
-		if err != nil {
-			server.error(err, w)
-			return
-		}
-		var statusCode int
-		if sync {
-			statusCode = http.StatusOK
-		} else {
-			statusCode = http.StatusAccepted
-		}
-		server.write(statusCode, obj, w)
-		return
-	default:
-		server.notFound(req, w)
-	}
+	return strings.Split(path, "/")
 }
